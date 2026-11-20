@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
+import { ObjectId } from "mongodb";
 
 const app = express();
 const port = process.env.PORT;
@@ -31,10 +32,62 @@ app.get("/users", async (req, res) => {
   const result = await cursor.toArray();
   res.send(result);
 });
+
+// Equipment related apis
+// getting all equipments
 app.get("/equipments", async (req, res) => {
-  const cursor = equipments.find({});
-  const result = await cursor.toArray();
-  res.send(result);
+  try {
+    const result = await equipments.find({}).toArray();
+
+    res.status(200).send({
+      success: true,
+      message: "Equipments retrieved successfully",
+      data: result,
+    });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to retrieve equipments",
+      error,
+    });
+  }
+});
+
+// getting single equipments
+app.get("/equipments/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid equipment ID",
+      });
+    }
+
+    const query = { _id: new ObjectId(id) };
+
+    const result = await equipments.findOne(query);
+
+    if (!result) {
+      return res.status(404).send({
+        success: false,
+        message: "Equipment not found",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).send({
+      success: false,
+      message: "Something went wrong",
+    });
+  }
 });
 
 app.get("/", (req, res) => {
