@@ -69,6 +69,7 @@ app.post("/equipments", async (req, res) => {
       location,
       rentalTerms,
       imageUrls,
+      owner,
     } = req.body ?? {};
 
     const requiredFields = {
@@ -126,6 +127,12 @@ app.post("/equipments", async (req, res) => {
       rentalPeriod: String(rentalPeriod).trim(),
       location: String(location).trim(),
       rentalTerms: String(rentalTerms ?? "").trim(),
+      status: "pending",
+      owner: {
+        name: String(owner?.name ?? "").trim(),
+        email: String(owner?.email ?? "").trim(),
+        isVerified: owner?.isVerified ?? true,
+      },
       createdAt: new Date(),
       updatedAt: new Date(),
     };
@@ -180,6 +187,145 @@ app.get("/equipments/:id", async (req, res) => {
     res.status(500).send({
       success: false,
       message: "Something went wrong",
+    });
+  }
+});
+
+// updating an equipment listing
+app.patch("/equipments/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid equipment ID",
+      });
+    }
+
+    const query = { _id: new ObjectId(id) };
+    const existing = await equipments.findOne(query);
+
+    if (!existing) {
+      return res.status(404).send({
+        success: false,
+        message: "Equipment not found",
+      });
+    }
+
+    const body = req.body ?? {};
+    const pick = (key, fallback = "") =>
+      body[key] !== undefined ? body[key] : existing[key] ?? fallback;
+
+    const urls =
+      body.imageUrls !== undefined
+        ? Array.isArray(body.imageUrls)
+          ? body.imageUrls.filter((url) => typeof url === "string" && url.trim() !== "")
+          : []
+        : Array.isArray(existing.images)
+          ? existing.images
+          : existing.image
+            ? [existing.image]
+            : [];
+
+    const name = String(pick("name")).trim();
+    const category = String(pick("category")).trim();
+    const description = String(pick("description")).trim();
+    const rentalRate = Number(pick("rentalRate"));
+    const rentalPeriod = String(pick("rentalPeriod")).trim();
+    const availableStock = Number(pick("availableStock"));
+    const location = String(pick("location")).trim();
+
+    if (!name || !category || !description || !rentalPeriod || !location) {
+      return res.status(400).send({
+        success: false,
+        message: "Please complete all required fields.",
+      });
+    }
+
+    if (
+      !Number.isFinite(rentalRate) ||
+      rentalRate <= 0 ||
+      !Number.isInteger(availableStock) ||
+      availableStock < 1
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Rental rate and available stock must be valid positive numbers.",
+      });
+    }
+
+    const update = {
+      name,
+      shortDescription: description.slice(0, 160),
+      description,
+      category,
+      image: urls[0] ?? "",
+      images: urls,
+      brand: String(pick("brand")).trim(),
+      model: String(pick("model")).trim(),
+      condition: String(pick("condition", "Good")).trim(),
+      availableStock,
+      rentalRate,
+      rentalPeriod,
+      location,
+      rentalTerms: String(pick("rentalTerms")).trim(),
+      status: existing.status ?? "pending",
+      owner: existing.owner ?? {
+        name: String(body.owner?.name ?? "").trim(),
+        email: String(body.owner?.email ?? "").trim(),
+        isVerified: body.owner?.isVerified ?? true,
+      },
+      updatedAt: new Date(),
+    };
+
+    await equipments.updateOne(query, { $set: update });
+    const updated = await equipments.findOne(query);
+
+    res.status(200).send({
+      success: true,
+      message: "Equipment updated successfully",
+      data: { ...updated, _id: id },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to update equipment",
+    });
+  }
+});
+
+// deleting an equipment listing
+app.delete("/equipments/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid equipment ID",
+      });
+    }
+
+    const result = await equipments.deleteOne({ _id: new ObjectId(id) });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Equipment not found",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "Equipment deleted successfully",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to delete equipment",
     });
   }
 });
