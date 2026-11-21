@@ -1,14 +1,31 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
-import { ObjectId } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
+import { betterAuth } from "better-auth";
+import { mongodbAdapter } from "@better-auth/mongo-adapter";
 
 const app = express();
 const port = process.env.PORT;
 
+const allowedOrigins = (process.env.FRONTEND_URL ?? "http://localhost:3000")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 app.use(express.json());
-app.use(cors());
-import { MongoClient } from "mongodb";
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Server-to-server calls (Next.js route handlers) send no Origin header.
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error("Origin not allowed by CORS"));
+    },
+    credentials: true,
+  }),
+);
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
@@ -27,10 +44,335 @@ const database = connectedClient.db("gearnestdb");
 const users = database.collection("user");
 const equipments = database.collection("equipments");
 
-app.get("/users", async (req, res) => {
-  const cursor = users.find({});
-  const result = await cursor.toArray();
-  res.send(result);
+/**
+ * Better Auth verification for Express. It shares the secret and MongoDB
+ * adapter with the Next.js app, so the same signed session cookie can be
+ * verified here without inventing a JWT or trusting client-supplied identity.
+ */
+const auth = betterAuth({
+  baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
+  secret: process.env.BETTER_AUTH_SECRET,
+  database: mongodbAdapter(database, { client: connectedClient }),
+  trustedOrigins: allowedOrigins,
+  user: {
+    additionalFields: {
+      role: {
+        type: ["customer", "admin", "owner"],
+        required: false,
+        defaultValue: "customer",
+      },
+      phone: { type: "string", required: false, defaultValue: "" },
+      address: { type: "string", required: false, defaultValue: "" },
+    },
+  },
+});
+
+const USER_ROLES = ["customer", "owner", "admin"];
+const safeUserProjection = {
+  _id: 1,
+  name: 1,
+  email: 1,
+  emailVerified: 1,
+  image: 1,
+  createdAt: 1,
+  updatedAt: 1,
+  role: 1,
+  address: 1,
+  phone: 1,
+};
+
+const toHeaders = (req) => {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers ?? {})) {
+    if (Array.isArray(value)) {
+      for (const entry of value) headers.append(key, entry);
+    } else if (value !== undefined) {
+      headers.set(key, value);
+    }
+  }
+  return headers;
+};
+
+const normalizeRole = (role) => (USER_ROLES.includes(role) ? role : "customer");
+
+const toIsoString = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+};
+
+const serializeUser = (user) => ({
+  id: user._id?.toString() ?? "",
+  name: user.name ?? "",
+  email: user.email ?? "",
+  emailVerified: user.emailVerified === true,
+  image:
+    typeof user.image === "string" && user.image.trim() ? user.image : null,
+  role: normalizeRole(user.role),
+  address: user.address ?? "",
+  phone: user.phone ?? "",
+  createdAt: toIsoString(user.createdAt),
+  updatedAt: toIsoString(user.updatedAt),
+});
+
+const sendError = (res, status, message) =>
+  res.status(status).send({ success: false, message });
+
+const authenticate = async (req, res, next) => {
+  if (!process.env.BETTER_AUTH_SECRET) {
+    return sendError(res, 500, "Server authentication is not configured.");
+  }
+
+  try {
+    const session = await auth.api.getSession({
+      headers: toHeaders(req),
+      query: { disableCookieCache: true },
+    });
+
+    if (
+      !session?.session ||
+      !session.user?.id ||
+      !ObjectId.isValid(session.user.id)
+    ) {
+      return sendError(res, 401, "You must be signed in.");
+    }
+
+    // Always read the current role from the database. A role in a cookie,
+    // header, or request body is never trusted for authorization.
+    const currentUser = await users.findOne(
+      { _id: new ObjectId(session.user.id) },
+      { projection: safeUserProjection },
+    );
+
+    if (!currentUser) {
+      return sendError(res, 401, "Your account no longer exists.");
+    }
+
+    req.authUser = serializeUser(currentUser);
+    return next();
+  } catch (error) {
+    console.error("Could not verify Better Auth session", error);
+    return sendError(res, 401, "Your session is invalid or has expired.");
+  }
+};
+
+const requireAdmin = (req, res, next) => {
+  if (req.authUser?.role !== "admin") {
+    return sendError(res, 403, "Admin access required.");
+  }
+  return next();
+};
+
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * GET /users - admin-only, searchable, filterable, paginated user list.
+ * Query params: role=all|customer|owner|admin, search=<text>, page, limit.
+ */
+app.get("/users", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const requestedRole =
+      typeof req.query.role === "string"
+        ? req.query.role.trim().toLowerCase()
+        : "all";
+
+    if (!["all", ...USER_ROLES].includes(requestedRole)) {
+      return sendError(res, 400, "Invalid role filter.");
+    }
+
+    const search =
+      typeof req.query.search === "string" ? req.query.search.trim() : "";
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(
+      100,
+      Math.max(1, Number.parseInt(req.query.limit, 10) || 10),
+    );
+
+    const query = {};
+    if (requestedRole !== "all") query.role = requestedRole;
+    if (search) {
+      const pattern = escapeRegex(search);
+      query.$or = [
+        { name: { $regex: pattern, $options: "i" } },
+        { email: { $regex: pattern, $options: "i" } },
+      ];
+    }
+
+    const [matchedUsers, filteredTotal, totalRegisteredUsers, roleGroups] =
+      await Promise.all([
+        users
+          .find(query, { projection: safeUserProjection })
+          .sort({ createdAt: -1 })
+          .skip((page - 1) * limit)
+          .limit(limit)
+          .toArray(),
+        users.countDocuments(query),
+        users.countDocuments({}),
+        users
+          .aggregate([{ $group: { _id: "$role", count: { $sum: 1 } } }])
+          .toArray(),
+      ]);
+
+    const roleCounts = {
+      all: totalRegisteredUsers,
+      customer: 0,
+      owner: 0,
+      admin: 0,
+    };
+    for (const group of roleGroups) {
+      const role = normalizeRole(group._id);
+      roleCounts[role] = (roleCounts[role] ?? 0) + group.count;
+    }
+
+    return res.status(200).send({
+      success: true,
+      message: "Users retrieved successfully",
+      data: {
+        users: matchedUsers.map(serializeUser),
+        totalUsers: filteredTotal,
+        totalRegisteredUsers,
+        roleCounts,
+        currentPage: page,
+        totalPages: Math.max(1, Math.ceil(filteredTotal / limit)),
+        limit,
+      },
+    });
+  } catch (error) {
+    console.error("Could not retrieve users", error);
+    return sendError(res, 500, "Could not retrieve users.");
+  }
+});
+
+/** PATCH /users/:id/role - admin-only role assignment. */
+app.patch("/users/:id/role", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return sendError(res, 400, "Invalid user ID.");
+    }
+
+    const requestedRole =
+      typeof req.body?.role === "string"
+        ? req.body.role.trim().toLowerCase()
+        : "";
+    if (!USER_ROLES.includes(requestedRole)) {
+      return sendError(res, 400, "Role must be customer, owner, or admin.");
+    }
+
+    const targetId = new ObjectId(id);
+    const target = await users.findOne(
+      { _id: targetId },
+      { projection: safeUserProjection },
+    );
+    if (!target) {
+      return sendError(res, 404, "User not found.");
+    }
+
+    const currentRole = normalizeRole(target.role);
+    if (currentRole === requestedRole) {
+      return res.status(200).send({
+        success: true,
+        message: `User already has the ${requestedRole} role.`,
+        data: serializeUser(target),
+      });
+    }
+
+    if (id === req.authUser.id && requestedRole !== "admin") {
+      return sendError(res, 403, "You cannot demote your own account.");
+    }
+
+    if (currentRole === "admin" && requestedRole !== "admin") {
+      const adminCount = await users.countDocuments({ role: "admin" });
+      if (adminCount <= 1) {
+        return sendError(res, 409, "Cannot demote the last administrator.");
+      }
+    }
+
+    await users.updateOne(
+      { _id: targetId },
+      { $set: { role: requestedRole, updatedAt: new Date() } },
+    );
+
+    const updated = await users.findOne(
+      { _id: targetId },
+      { projection: safeUserProjection },
+    );
+
+    return res.status(200).send({
+      success: true,
+      message: "User role updated successfully.",
+      data: serializeUser(updated),
+    });
+  } catch (error) {
+    console.error("Could not update user role", error);
+    return sendError(res, 500, "Could not update user role.");
+  }
+});
+
+/** DELETE /users/:id - admin-only account deletion with auth cleanup. */
+app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return sendError(res, 400, "Invalid user ID.");
+    }
+    if (id === req.authUser.id) {
+      return sendError(res, 403, "You cannot delete your own account.");
+    }
+
+    const targetId = new ObjectId(id);
+    const target = await users.findOne(
+      { _id: targetId },
+      { projection: safeUserProjection },
+    );
+    if (!target) {
+      return sendError(res, 404, "User not found.");
+    }
+
+    if (normalizeRole(target.role) === "admin") {
+      const adminCount = await users.countDocuments({ role: "admin" });
+      if (adminCount <= 1) {
+        return sendError(res, 409, "Cannot delete the last administrator.");
+      }
+    }
+
+    const deleted = await users.deleteOne({ _id: targetId });
+    if (deleted.deletedCount === 0) {
+      return sendError(res, 404, "User not found.");
+    }
+
+    // Better Auth keeps sessions/accounts/verification in separate collections.
+    // userId is an ObjectId in session/account and may be a string elsewhere.
+    const userIds = [targetId, id];
+    const cleanup = await Promise.allSettled([
+      database.collection("session").deleteMany({ userId: { $in: userIds } }),
+      database.collection("account").deleteMany({ userId: { $in: userIds } }),
+      database
+        .collection("verification")
+        .deleteMany({ userId: { $in: userIds } }),
+    ]);
+
+    const cleanupFailed = cleanup.some(
+      (result) => result.status === "rejected",
+    );
+    if (cleanupFailed) {
+      console.error(
+        "Some authentication records could not be removed",
+        cleanup.filter((result) => result.status === "rejected"),
+      );
+    }
+
+    return res.status(200).send({
+      success: true,
+      message: cleanupFailed
+        ? "User deleted, but some related authentication records could not be removed."
+        : "User and related authentication records deleted successfully.",
+      data: { id },
+    });
+  } catch (error) {
+    console.error("Could not delete user", error);
+    return sendError(res, 500, "Could not delete user.");
+  }
 });
 
 // Equipment related apis
@@ -83,7 +425,9 @@ app.post("/equipments", async (req, res) => {
     };
 
     const missingFields = Object.entries(requiredFields)
-      .filter(([, value]) => value === undefined || value === null || value === "")
+      .filter(
+        ([, value]) => value === undefined || value === null || value === "",
+      )
       .map(([field]) => field);
 
     if (missingFields.length > 0) {
@@ -104,7 +448,8 @@ app.post("/equipments", async (req, res) => {
     ) {
       return res.status(400).send({
         success: false,
-        message: "Rental rate and available stock must be valid positive numbers.",
+        message:
+          "Rental rate and available stock must be valid positive numbers.",
       });
     }
 
@@ -215,12 +560,14 @@ app.patch("/equipments/:id", async (req, res) => {
 
     const body = req.body ?? {};
     const pick = (key, fallback = "") =>
-      body[key] !== undefined ? body[key] : existing[key] ?? fallback;
+      body[key] !== undefined ? body[key] : (existing[key] ?? fallback);
 
     const urls =
       body.imageUrls !== undefined
         ? Array.isArray(body.imageUrls)
-          ? body.imageUrls.filter((url) => typeof url === "string" && url.trim() !== "")
+          ? body.imageUrls.filter(
+              (url) => typeof url === "string" && url.trim() !== "",
+            )
           : []
         : Array.isArray(existing.images)
           ? existing.images
@@ -251,7 +598,8 @@ app.patch("/equipments/:id", async (req, res) => {
     ) {
       return res.status(400).send({
         success: false,
-        message: "Rental rate and available stock must be valid positive numbers.",
+        message:
+          "Rental rate and available stock must be valid positive numbers.",
       });
     }
 
