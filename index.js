@@ -4,6 +4,22 @@ import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
+import {
+  getAdminAnalyticsOverview,
+  getAdminMonthlyBookings,
+  parseAnalyticsYear,
+} from "./analytics.js";
+import {
+  getAdminBookings,
+  isBookingStatus,
+  parseBookingsQuery,
+  updateAdminBookingStatus,
+} from "./bookings.js";
+import {
+  equipmentStatusExpression,
+  isEquipmentStatus,
+  updateEquipmentStatus,
+} from "./equipment-moderation.js";
 
 const app = express();
 const port = process.env.PORT;
@@ -375,11 +391,160 @@ app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
   }
 });
 
+/**
+ * GET /admin/analytics - admin-only aggregated platform overview.
+ * All metrics, including the latest bookings, come from MongoDB.
+ */
+app.get("/admin/analytics", authenticate, requireAdmin, async (req, res) => {
+  try {
+    const data = await getAdminAnalyticsOverview(database);
+
+    return res.status(200).send({
+      success: true,
+      message: "Platform analytics retrieved successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Could not retrieve admin analytics", error);
+    return sendError(res, 500, "Could not retrieve platform analytics.");
+  }
+});
+
+/**
+ * GET /admin/analytics/monthly-bookings?year=2026 - admin-only monthly chart
+ * data. All 12 months are returned; months without bookings stay at zero.
+ */
+app.get(
+  "/admin/analytics/monthly-bookings",
+  authenticate,
+  requireAdmin,
+  async (req, res) => {
+    const year = parseAnalyticsYear(req.query.year);
+    if (year === null) {
+      return sendError(res, 400, "Provide a valid booking year.");
+    }
+
+    try {
+      const data = await getAdminMonthlyBookings(database, year);
+
+      return res.status(200).send({
+        success: true,
+        message: "Monthly booking statistics retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve monthly booking statistics", error);
+      return sendError(
+        res,
+        500,
+        "Could not retrieve monthly booking statistics.",
+      );
+    }
+  },
+);
+
+/**
+ * GET /admin/bookings - admin-only, searchable, paginated booking record.
+ * Query params: status=all|pending|confirmed|cancelled, search, page, limit,
+ * sort=newest|oldest.
+ */
+app.get("/admin/bookings", authenticate, requireAdmin, async (req, res) => {
+  const options = parseBookingsQuery(req.query);
+  if (!options) {
+    return sendError(res, 400, "Invalid booking search parameters.");
+  }
+
+  try {
+    const data = await getAdminBookings(database, options);
+
+    return res.status(200).send({
+      success: true,
+      message: "Bookings retrieved successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Could not retrieve admin bookings", error);
+    return sendError(res, 500, "Could not retrieve bookings.");
+  }
+});
+
+/** PATCH /admin/bookings/:id/status - admin-only booking status moderation. */
+app.patch(
+  "/admin/bookings/:id/status",
+  authenticate,
+  requireAdmin,
+  async (req, res) => {
+    const requestedStatus = req.body?.status;
+    if (!isBookingStatus(requestedStatus)) {
+      return sendError(res, 400, "Invalid booking status.");
+    }
+
+    try {
+      const result = await updateAdminBookingStatus(
+        database,
+        req.params.id,
+        requestedStatus,
+      );
+
+      if (result.invalidRequest) {
+        return sendError(res, 400, "Invalid booking ID or status.");
+      }
+      if (result.notFound) {
+        return sendError(res, 404, "Booking not found.");
+      }
+      if (result.invalidTransition) {
+        return sendError(
+          res,
+          409,
+          `Cannot change a ${result.current} booking to ${requestedStatus}.`,
+        );
+      }
+
+      return res.status(200).send({
+        success: true,
+        message: result.unchanged
+          ? "Booking status is already up to date."
+          : "Booking status updated successfully",
+        data: result.booking,
+      });
+    } catch (error) {
+      console.error("Could not update booking status", error);
+      return sendError(res, 500, "Could not update booking status.");
+    }
+  },
+);
+
 // Equipment related apis
-// getting all equipments
+
+/**
+ * GET /equipments - approved listings by default. Admin/owner views request
+ * `status=all` so pending submissions remain visible to the people who manage
+ * them without exposing them on the public catalog.
+ */
 app.get("/equipments", async (req, res) => {
   try {
-    const result = await equipments.find({}).toArray();
+    const requestedStatus =
+      typeof req.query.status === "string"
+        ? req.query.status.trim().toLowerCase()
+        : "approved";
+
+    if (
+      !["all", "approved", "pending", "rejected"].includes(requestedStatus)
+    ) {
+      return sendError(res, 400, "Invalid equipment status filter.");
+    }
+
+    const pipeline = [
+      { $addFields: { normalizedStatus: equipmentStatusExpression } },
+    ];
+
+    if (requestedStatus !== "all") {
+      pipeline.push({ $match: { normalizedStatus: requestedStatus } });
+    }
+
+    pipeline.push({ $project: { normalizedStatus: 0 } });
+
+    const result = await equipments.aggregate(pipeline).toArray();
 
     res.status(200).send({
       success: true,
@@ -387,13 +552,61 @@ app.get("/equipments", async (req, res) => {
       data: result,
     });
   } catch (error) {
+    console.error("Could not retrieve equipments", error);
     res.status(500).send({
       success: false,
       message: "Failed to retrieve equipments",
-      error,
     });
   }
 });
+
+/**
+ * PATCH /admin/equipments/:id/status - approve or reject a pending listing.
+ */
+app.patch(
+  "/admin/equipments/:id/status",
+  authenticate,
+  requireAdmin,
+  async (req, res) => {
+    const requestedStatus = req.body?.status;
+    if (!isEquipmentStatus(requestedStatus)) {
+      return sendError(res, 400, "Invalid equipment status.");
+    }
+
+    try {
+      const result = await updateEquipmentStatus(
+        database,
+        req.params.id,
+        requestedStatus,
+      );
+
+      if (result.invalidRequest) {
+        return sendError(res, 400, "Invalid equipment ID or status.");
+      }
+      if (result.notFound) {
+        return sendError(res, 404, "Equipment not found.");
+      }
+      if (result.invalidTransition) {
+        return sendError(
+          res,
+          409,
+          `Cannot change a ${result.current} listing to ${requestedStatus}.`,
+        );
+      }
+
+      return res.status(200).send({
+        success: true,
+        message: result.unchanged
+          ? "Equipment status is already up to date."
+          : `Equipment ${requestedStatus} successfully`,
+        data: result.equipment,
+      });
+    } catch (error) {
+      console.error("Could not update equipment status", error);
+      return sendError(res, 500, "Could not update equipment status.");
+    }
+  },
+);
 
 // creating a new equipment listing
 app.post("/equipments", async (req, res) => {
