@@ -271,7 +271,9 @@ const verifyEquipmentOwnership = async (req, res, next) => {
     const ownerEmail = String(equipment.owner?.email ?? "")
       .trim()
       .toLowerCase();
-    const userEmail = String(req.authUser?.email ?? "").trim().toLowerCase();
+    const userEmail = String(req.authUser?.email ?? "")
+      .trim()
+      .toLowerCase();
 
     if (!ownerEmail || ownerEmail !== userEmail) {
       return sendError(res, 403, "You can only manage your own equipment.");
@@ -285,7 +287,11 @@ const verifyEquipmentOwnership = async (req, res, next) => {
 };
 
 /** Reusable chain for owner-scoped equipment mutations. */
-const verifyOwnedEquipment = [verifyToken, verifyOwner, verifyEquipmentOwnership];
+const verifyOwnedEquipment = [
+  verifyToken,
+  verifyOwner,
+  verifyEquipmentOwnership,
+];
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -885,24 +891,19 @@ app.get("/owner/rentals", verifyToken, verifyOwner, async (req, res) => {
 });
 
 /** GET /owner/rentals/stats - owner-global rental counts. */
-app.get(
-  "/owner/rentals/stats",
-  verifyToken,
-  verifyOwner,
-  async (req, res) => {
-    try {
-      const data = await getOwnerRentalStats(database, req.authUser);
-      return res.status(200).send({
-        success: true,
-        message: "Rental statistics retrieved successfully",
-        data,
-      });
-    } catch (error) {
-      console.error("Could not retrieve owner rental statistics", error);
-      return sendError(res, 500, "Could not load your rental statistics.");
-    }
-  },
-);
+app.get("/owner/rentals/stats", verifyToken, verifyOwner, async (req, res) => {
+  try {
+    const data = await getOwnerRentalStats(database, req.authUser);
+    return res.status(200).send({
+      success: true,
+      message: "Rental statistics retrieved successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Could not retrieve owner rental statistics", error);
+    return sendError(res, 500, "Could not load your rental statistics.");
+  }
+});
 
 /**
  * PATCH /owner/rentals/:id/status - owner approval/rejection for a pending
@@ -940,7 +941,11 @@ app.patch(
         );
       }
       if (result.conflict) {
-        return sendError(res, 409, result.detail ?? "This request is no longer available.");
+        return sendError(
+          res,
+          409,
+          result.detail ?? "This request is no longer available.",
+        );
       }
       if (result.stale) {
         return sendError(
@@ -976,9 +981,7 @@ app.get("/equipments", verifyEquipmentListAccess, async (req, res) => {
   try {
     const requestedStatus = req.equipmentStatusFilter;
 
-    if (
-      !["all", "approved", "pending", "rejected"].includes(requestedStatus)
-    ) {
+    if (!["all", "approved", "pending", "rejected"].includes(requestedStatus)) {
       return sendError(res, 400, "Invalid equipment status filter.");
     }
 
@@ -1354,3 +1357,5 @@ app.get("/", (req, res) => {
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
+
+export default app;
