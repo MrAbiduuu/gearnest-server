@@ -25,7 +25,12 @@ const MONTH_LABELS = [
   "Dec",
 ];
 
-const CHART_INCLUDED_STATUSES = ["pending", "confirmed", "cancelled"];
+const CHART_INCLUDED_STATUSES = [
+  "pending",
+  "confirmed",
+  "completed",
+  "cancelled",
+];
 const REVENUE_EXCLUDED_PAYMENT_STATUSES = [
   "unpaid",
   "refunded",
@@ -72,6 +77,10 @@ const bookingStatusExpression = {
   $switch: {
     branches: [
       { case: { $eq: [lowerStatus, "pending"] }, then: "pending" },
+      {
+        case: { $in: [lowerStatus, ["completed", "complete"]] },
+        then: "completed",
+      },
       {
         case: { $in: [lowerStatus, ["cancelled", "canceled"]] },
         then: "cancelled",
@@ -244,6 +253,11 @@ export const getAdminAnalyticsOverview = async (database) => {
                     $cond: [{ $eq: ["$bookingStatus", "pending"] }, 1, 0],
                   },
                 },
+                completedBookings: {
+                  $sum: {
+                    $cond: [{ $eq: ["$bookingStatus", "completed"] }, 1, 0],
+                  },
+                },
               },
             },
           ],
@@ -406,6 +420,7 @@ export const getAdminAnalyticsOverview = async (database) => {
     pendingEquipment: equipmentCounts.pending,
     totalBookings: count(summary?.totalBookings),
     confirmedBookings: count(summary?.confirmedBookings),
+    completedBookings: count(summary?.completedBookings),
     pendingBookings: count(summary?.pendingBookings),
     paidTransactions: count(paymentSummary?.paidTransactions),
     totalRevenue: count(paymentSummary?.revenueMinorUnits) / 100,

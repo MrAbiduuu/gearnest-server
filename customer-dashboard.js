@@ -6,8 +6,8 @@
  * database. No customer ID is accepted from the query string or request body.
  *
  * A booking is a `purchases` document. `amountTotal` is in Stripe minor units
- * and is converted to major units here. Only the three real booking statuses
- * (pending, confirmed, cancelled) are returned to the client.
+ * and is converted to major units here. All real booking statuses
+ * (pending, confirmed, completed, cancelled) are returned to the client.
  */
 const USER_COLLECTION = "user";
 const EQUIPMENT_COLLECTION = "equipments";
@@ -18,7 +18,7 @@ const REVIEW_COLLECTION = "reviews";
 const RECENT_LIMIT = 3;
 const MAX_RECENT_LIMIT = 5;
 const DEFAULT_RECENT_LIMIT = 3;
-const BOOKING_STATUSES = ["pending", "confirmed", "cancelled"];
+const BOOKING_STATUSES = ["pending", "confirmed", "completed", "cancelled"];
 const BOOKING_PERIODS = [3, 6, 12];
 const REVENUE_EXCLUDED_PAYMENT_STATUSES = [
   "unpaid",
@@ -79,6 +79,10 @@ const bookingStatusExpression = {
   $switch: {
     branches: [
       { case: { $eq: [lowerText("status"), "pending"] }, then: "pending" },
+      {
+        case: { $in: [lowerText("status"), ["completed", "complete"]] },
+        then: "completed",
+      },
       {
         case: { $in: [lowerText("status"), ["cancelled", "canceled"]] },
         then: "cancelled",
@@ -188,6 +192,9 @@ const statusAccumulator = {
   confirmedBookings: {
     $sum: { $cond: [{ $eq: ["$bookingStatus", "confirmed"] }, 1, 0] },
   },
+  completedBookings: {
+    $sum: { $cond: [{ $eq: ["$bookingStatus", "completed"] }, 1, 0] },
+  },
   cancelledBookings: {
     $sum: { $cond: [{ $eq: ["$bookingStatus", "cancelled"] }, 1, 0] },
   },
@@ -228,7 +235,9 @@ const serializeRecentBooking = (row) => {
     totalAmount: count(row?.totalAmount),
     currency: row?.currency || "BDT",
     createdAt: row?.createdAt ?? undefined,
-    canReview: status === "confirmed" && paymentStatus === "paid",
+    canReview:
+      (status === "confirmed" || status === "completed") &&
+      paymentStatus === "paid",
   };
 };
 
@@ -433,6 +442,7 @@ export const getCustomerDashboardOverview = async (database, authUser) => {
     totalBookings: count(bookingSummary.totalBookings),
     pendingBookings: count(bookingSummary.pendingBookings),
     confirmedBookings: count(bookingSummary.confirmedBookings),
+    completedBookings: count(bookingSummary.completedBookings),
     cancelledBookings: count(bookingSummary.cancelledBookings),
     favoriteItems,
     /** Gross successful payment volume; not a payout or commission. */
@@ -478,6 +488,7 @@ export const getCustomerBookingStatus = async (database, authUser) => {
       all: count(summary.totalBookings),
       pending: count(summary.pendingBookings),
       confirmed: count(summary.confirmedBookings),
+      completed: count(summary.completedBookings),
       cancelled: count(summary.cancelledBookings),
     },
     bookingStatusesIncluded: BOOKING_STATUSES,
@@ -542,6 +553,7 @@ export const getCustomerBookingAnalytics = async (
         totalBookings: 0,
         pendingBookings: 0,
         confirmedBookings: 0,
+        completedBookings: 0,
         cancelledBookings: 0,
       });
     }
@@ -551,6 +563,7 @@ export const getCustomerBookingAnalytics = async (
     entry.totalBookings += value;
 
     if (row._id.status === "pending") entry.pendingBookings += value;
+    else if (row._id.status === "completed") entry.completedBookings += value;
     else if (row._id.status === "cancelled") entry.cancelledBookings += value;
     else entry.confirmedBookings += value;
   }
@@ -561,6 +574,7 @@ export const getCustomerBookingAnalytics = async (
       totalBookings: 0,
       pendingBookings: 0,
       confirmedBookings: 0,
+      completedBookings: 0,
       cancelledBookings: 0,
     }),
   }));

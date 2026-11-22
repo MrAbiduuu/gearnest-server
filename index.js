@@ -40,6 +40,7 @@ import {
   getOwnerRentals,
   updateOwnerRentalStatus,
 } from "./owner-rentals.js";
+import { startBookingCompletionCron } from "./booking-completion-cron.js";
 
 const app = express();
 const port = process.env.PORT;
@@ -79,6 +80,9 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db("gearnestdb");
 const users = database.collection("user");
 const equipments = database.collection("equipments");
+
+// Marks confirmed rentals as completed once their end date has passed.
+await startBookingCompletionCron(database);
 
 // The Next.js app signs short-lived JWTs with the shared Better Auth secret
 // and JWKS. Express uses the same issuer/audience so it can verify them here.
@@ -583,7 +587,7 @@ app.get(
 
 /**
  * GET /admin/bookings - admin-only, searchable, paginated booking record.
- * Query params: status=all|pending|confirmed|cancelled, search, page, limit,
+ * Query params: status=all|pending|confirmed|completed|cancelled, search, page, limit,
  * sort=newest|oldest.
  */
 app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {

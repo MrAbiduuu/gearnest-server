@@ -82,6 +82,10 @@ const bookingStatusExpression = {
     branches: [
       { case: { $eq: [lowerText("status"), "pending"] }, then: "pending" },
       {
+        case: { $in: [lowerText("status"), ["completed", "complete"]] },
+        then: "completed",
+      },
+      {
         case: { $in: [lowerText("status"), ["cancelled", "canceled"]] },
         then: "cancelled",
       },
@@ -346,6 +350,11 @@ export const getOwnerDashboardOverview = async (database, authUser) => {
                     $cond: [{ $eq: ["$bookingStatus", "confirmed"] }, 1, 0],
                   },
                 },
+                completedBookings: {
+                  $sum: {
+                    $cond: [{ $eq: ["$bookingStatus", "completed"] }, 1, 0],
+                  },
+                },
                 cancelledBookings: {
                   $sum: {
                     $cond: [{ $eq: ["$bookingStatus", "cancelled"] }, 1, 0],
@@ -355,9 +364,14 @@ export const getOwnerDashboardOverview = async (database, authUser) => {
                   $sum: {
                     $cond: [
                       {
-                        $and: [
-                          { $eq: ["$bookingStatus", "confirmed"] },
-                          "$isSuccessfulPayment",
+                        $or: [
+                          { $eq: ["$bookingStatus", "completed"] },
+                          {
+                            $and: [
+                              { $eq: ["$bookingStatus", "confirmed"] },
+                              "$isSuccessfulPayment",
+                            ],
+                          },
                         ],
                       },
                       1,
@@ -453,6 +467,7 @@ export const getOwnerDashboardOverview = async (database, authUser) => {
     totalBookings: count(bookingSummary.totalBookings),
     pendingBookings: count(bookingSummary.pendingBookings),
     confirmedBookings: count(bookingSummary.confirmedBookings),
+    completedBookings: count(bookingSummary.completedBookings),
     cancelledBookings: count(bookingSummary.cancelledBookings),
     completedRentals: count(bookingSummary.completedRentals),
     paidTransactions: count(paymentSummary.paidTransactions),
@@ -464,7 +479,7 @@ export const getOwnerDashboardOverview = async (database, authUser) => {
     ),
     definitions: {
       completedRentals:
-        "Confirmed bookings with a successful payment. GearNest has no separate completed booking status.",
+        "Rentals with a completed booking status, plus legacy paid confirmed bookings that predate the status.",
       paidRentalVolume:
         "Gross successful payment volume for the owner's equipment. No owner payout or commission field is stored.",
       availableEquipment: "Listings with availableStock greater than zero.",
@@ -634,12 +649,14 @@ export const getOwnerMonthlyBookings = async (database, authUser, year) => {
       totalBookings: 0,
       pendingBookings: 0,
       confirmedBookings: 0,
+      completedBookings: 0,
       cancelledBookings: 0,
     };
     const value = count(row.count);
     entry.totalBookings += value;
 
     if (row._id.status === "pending") entry.pendingBookings += value;
+    else if (row._id.status === "completed") entry.completedBookings += value;
     else if (row._id.status === "cancelled") entry.cancelledBookings += value;
     else entry.confirmedBookings += value;
 
@@ -656,10 +673,11 @@ export const getOwnerMonthlyBookings = async (database, authUser, year) => {
         totalBookings: 0,
         pendingBookings: 0,
         confirmedBookings: 0,
+        completedBookings: 0,
         cancelledBookings: 0,
       }),
     })),
-    bookingStatusesIncluded: ["pending", "confirmed", "cancelled"],
+    bookingStatusesIncluded: ["pending", "confirmed", "completed", "cancelled"],
     timezone: "UTC",
   };
 };

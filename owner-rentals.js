@@ -64,6 +64,10 @@ const bookingStatusExpression = {
     branches: [
       { case: { $eq: [lowerTextOf("status"), "pending"] }, then: "pending" },
       {
+        case: { $in: [lowerTextOf("status"), ["completed", "complete"]] },
+        then: "completed",
+      },
+      {
         case: { $in: [lowerTextOf("status"), ["cancelled", "canceled"]] },
         then: "cancelled",
       },
@@ -296,7 +300,7 @@ const normalizePaymentStatus = (value) => {
 };
 
 const buildStats = (rows, totalBookings) => {
-  const counts = { pending: 0, confirmed: 0, cancelled: 0 };
+  const counts = { pending: 0, confirmed: 0, completed: 0, cancelled: 0 };
   for (const row of rows ?? []) {
     if (BOOKING_STATUSES.includes(row?._id)) {
       counts[row._id] = countValue(row.count);
@@ -306,7 +310,11 @@ const buildStats = (rows, totalBookings) => {
   return {
     totalBookings: countValue(totalBookings),
     statusCounts: {
-      all: counts.pending + counts.confirmed + counts.cancelled,
+      all:
+        counts.pending +
+        counts.confirmed +
+        counts.completed +
+        counts.cancelled,
       ...counts,
     },
   };
@@ -362,6 +370,7 @@ const serializeOwnerRentalEquipment = (row) => {
     requestCount: countValue(row?.requestCount),
     pendingRequests: countValue(row?.pendingRequests),
     confirmedRequests,
+    completedRequests: countValue(row?.completedRequests),
     cancelledRequests: countValue(row?.cancelledRequests),
     isOnRent: confirmedRequests > 0,
     createdAt: row?.createdAt || undefined,
@@ -415,6 +424,15 @@ const getOwnerRentalEquipment = async (database, authUser, search) => {
                     ],
                   },
                 },
+                completed: {
+                  $sum: {
+                    $cond: [
+                      { $eq: [bookingStatusExpression, "completed"] },
+                      1,
+                      0,
+                    ],
+                  },
+                },
                 cancelled: {
                   $sum: {
                     $cond: [{ $eq: [bookingStatusExpression, "cancelled"] }, 1, 0],
@@ -432,7 +450,13 @@ const getOwnerRentalEquipment = async (database, authUser, search) => {
           rentalSummary: {
             $ifNull: [
               { $arrayElemAt: ["$rentalSummary", 0] },
-              { total: 0, pending: 0, confirmed: 0, cancelled: 0 },
+              {
+                total: 0,
+                pending: 0,
+                confirmed: 0,
+                completed: 0,
+                cancelled: 0,
+              },
             ],
           },
         },
@@ -456,6 +480,7 @@ const getOwnerRentalEquipment = async (database, authUser, search) => {
           requestCount: "$rentalSummary.total",
           pendingRequests: "$rentalSummary.pending",
           confirmedRequests: "$rentalSummary.confirmed",
+          completedRequests: "$rentalSummary.completed",
           cancelledRequests: "$rentalSummary.cancelled",
           isOnRent: { $gt: ["$rentalSummary.confirmed", 0] },
           createdAt: {

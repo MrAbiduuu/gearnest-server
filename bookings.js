@@ -11,12 +11,18 @@ const USER_COLLECTION = "user";
 const EQUIPMENT_COLLECTION = "equipments";
 const PURCHASE_COLLECTION = "purchases";
 
-export const BOOKING_STATUSES = ["pending", "confirmed", "cancelled"];
+export const BOOKING_STATUSES = [
+  "pending",
+  "confirmed",
+  "completed",
+  "cancelled",
+];
 export const BOOKING_PAYMENT_STATUSES = ["paid", "unpaid", "refunded"];
 
 const ALLOWED_TRANSITIONS = {
   pending: ["confirmed", "cancelled"],
-  confirmed: ["cancelled"],
+  confirmed: ["completed", "cancelled"],
+  completed: [],
   cancelled: [],
 };
 
@@ -62,6 +68,10 @@ const statusExpression = {
       {
         case: { $eq: [lowerTextOf("status"), "pending"] },
         then: "pending",
+      },
+      {
+        case: { $in: [lowerTextOf("status"), ["completed", "complete"]] },
+        then: "completed",
       },
       {
         case: { $in: [lowerTextOf("status"), ["cancelled", "canceled"]] },
@@ -356,7 +366,12 @@ export const getAdminBookings = async (database, options) => {
     ])
     .toArray();
 
-  const statusCounts = { pending: 0, confirmed: 0, cancelled: 0 };
+  const statusCounts = {
+    pending: 0,
+    confirmed: 0,
+    completed: 0,
+    cancelled: 0,
+  };
   for (const row of result?.statusCounts ?? []) {
     if (isBookingStatus(row._id)) {
       statusCounts[row._id] = countValue(row.count);
@@ -373,7 +388,10 @@ export const getAdminBookings = async (database, options) => {
     total: matchedTotal,
     statusCounts: {
       all:
-        statusCounts.pending + statusCounts.confirmed + statusCounts.cancelled,
+        statusCounts.pending +
+        statusCounts.confirmed +
+        statusCounts.completed +
+        statusCounts.cancelled,
       ...statusCounts,
     },
     currentPage: page,
