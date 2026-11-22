@@ -26,6 +26,18 @@ const MONTH_LABELS = [
 ];
 
 const CHART_INCLUDED_STATUSES = ["pending", "confirmed", "cancelled"];
+const REVENUE_EXCLUDED_PAYMENT_STATUSES = [
+  "unpaid",
+  "refunded",
+  "failed",
+  "pending",
+];
+const REVENUE_EXCLUDED_BOOKING_STATUSES = [
+  "cancelled",
+  "canceled",
+  "deleted",
+  "invalid",
+];
 
 const stringExpression = (field, fallback) => ({
   $convert: {
@@ -95,11 +107,13 @@ const successfulPaymentExpression = {
   $and: [
     {
       $not: {
-        $in: [lowerStatus, ["cancelled", "canceled", "deleted", "invalid"]],
+        $in: [lowerStatus, REVENUE_EXCLUDED_BOOKING_STATUSES],
       },
     },
     {
-      $not: { $in: [lowerPaymentStatus, ["unpaid", "refunded", "failed"]] },
+      $not: {
+        $in: [lowerPaymentStatus, REVENUE_EXCLUDED_PAYMENT_STATUSES],
+      },
     },
     { $eq: [{ $ifNull: ["$refundedAt", null] }, null] },
     { $isNumber: "$amountTotal" },
@@ -118,6 +132,15 @@ const toStringExpression = (field) => ({
 
 const currencyExpression = {
   $toUpper: stringExpression("currency", "BDT"),
+};
+
+/** Stable payment identity: one Stripe Checkout Session is one transaction. */
+const paymentKeyExpression = {
+  $cond: [
+    { $gt: [{ $strLenCP: stringExpression("stripeSessionId", "") }, 0] },
+    { $concat: ["session:", stringExpression("stripeSessionId", "")] },
+    { $concat: ["purchase:", stringExpression("_id", "")] },
+  ],
 };
 
 const count = (value) =>
@@ -201,11 +224,12 @@ export const getAdminAnalyticsOverview = async (database) => {
           bookingStatus: bookingStatusExpression,
           paymentStatus: paymentStatusExpression,
           isSuccessfulPayment: successfulPaymentExpression,
+          paymentKey: paymentKeyExpression,
         },
       },
       {
         $facet: {
-          summary: [
+          bookings: [
             {
               $group: {
                 _id: null,
@@ -220,18 +244,22 @@ export const getAdminAnalyticsOverview = async (database) => {
                     $cond: [{ $eq: ["$bookingStatus", "pending"] }, 1, 0],
                   },
                 },
-                revenueMinorUnits: {
-                  $sum: {
-                    $cond: [
-                      "$isSuccessfulPayment",
-                      { $ifNull: ["$amountTotal", 0] },
-                      0,
-                    ],
-                  },
-                },
-                paidTransactions: {
-                  $sum: { $cond: ["$isSuccessfulPayment", 1, 0] },
-                },
+              },
+            },
+          ],
+          payments: [
+            { $match: { isSuccessfulPayment: true } },
+            {
+              $group: {
+                _id: "$paymentKey",
+                amountMinor: { $max: { $ifNull: ["$amountTotal", 0] } },
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                revenueMinorUnits: { $sum: "$amountMinor" },
+                paidTransactions: { $sum: 1 },
               },
             },
           ],
@@ -239,7 +267,13 @@ export const getAdminAnalyticsOverview = async (database) => {
             { $match: { isSuccessfulPayment: true } },
             {
               $group: {
-                _id: currencyExpression,
+                _id: "$paymentKey",
+                currency: { $first: currencyExpression },
+              },
+            },
+            {
+              $group: {
+                _id: "$currency",
                 count: { $sum: 1 },
               },
             },
@@ -344,7 +378,8 @@ export const getAdminAnalyticsOverview = async (database) => {
     ])
     .toArray();
 
-  const summary = purchaseResult?.summary?.[0];
+  const summary = purchaseResult?.bookings?.[0];
+  const paymentSummary = purchaseResult?.payments?.[0];
   const revenueCurrency = purchaseResult?.currency?.[0]?._id || "BDT";
 
   const latestBookings = (purchaseResult?.latest ?? []).map((booking) => ({
@@ -372,8 +407,8 @@ export const getAdminAnalyticsOverview = async (database) => {
     totalBookings: count(summary?.totalBookings),
     confirmedBookings: count(summary?.confirmedBookings),
     pendingBookings: count(summary?.pendingBookings),
-    paidTransactions: count(summary?.paidTransactions),
-    totalRevenue: count(summary?.revenueMinorUnits) / 100,
+    paidTransactions: count(paymentSummary?.paidTransactions),
+    totalRevenue: count(paymentSummary?.revenueMinorUnits) / 100,
     currency: revenueCurrency,
     latestBookings,
   };
@@ -429,5 +464,106 @@ export const getAdminMonthlyBookings = async (database, year) => {
       totalBookings: monthlyCounts.get(index + 1) ?? 0,
     })),
     bookingStatusesIncluded: CHART_INCLUDED_STATUSES,
+  };
+};
+
+/**
+ * Monthly gross paid rental volume for the selected year.
+ *
+ * Purchases are written only after Stripe confirms a paid Checkout Session, so
+ * `createdAt` is the closest available payment completion date. The pipeline
+ * deduplicates by `stripeSessionId` before grouping by month and never mixes
+ * currencies in the chart: the dominant actual currency from the records is
+ * returned with the series.
+ */
+export const getAdminMonthlyRevenue = async (database, year) => {
+  const purchases = database.collection(PURCHASE_COLLECTION);
+  const start = new Date(Date.UTC(year, 0, 1));
+  const end = new Date(Date.UTC(year + 1, 0, 1));
+  const currentYear = new Date().getUTCFullYear();
+
+  const [result] = await purchases
+    .aggregate([
+      {
+        $addFields: {
+          createdAtDate: createdAtDateExpression,
+          isSuccessfulPayment: successfulPaymentExpression,
+          paymentKey: paymentKeyExpression,
+        },
+      },
+      { $match: { isSuccessfulPayment: true, createdAtDate: { $ne: null } } },
+      {
+        // One Stripe session must never be counted more than once.
+        $group: {
+          _id: "$paymentKey",
+          amountMinor: { $max: { $ifNull: ["$amountTotal", 0] } },
+          currency: { $first: currencyExpression },
+          createdAtDate: { $min: "$createdAtDate" },
+        },
+      },
+      {
+        $facet: {
+          years: [
+            { $group: { _id: { $year: "$createdAtDate" } } },
+            { $sort: { _id: -1 } },
+          ],
+          currencies: [
+            {
+              $group: {
+                _id: "$currency",
+                transactions: { $sum: 1 },
+                amountMinor: { $sum: "$amountMinor" },
+              },
+            },
+            { $sort: { transactions: -1, _id: 1 } },
+          ],
+          monthly: [
+            { $match: { createdAtDate: { $gte: start, $lt: end } } },
+            {
+              $group: {
+                _id: { $month: "$createdAtDate" },
+                revenueMinor: { $sum: "$amountMinor" },
+              },
+            },
+          ],
+        },
+      },
+    ])
+    .toArray();
+
+  const years = new Set([currentYear, year]);
+  for (const row of result?.years ?? []) {
+    if (Number.isInteger(row._id)) years.add(row._id);
+  }
+
+  const currencyRows = result?.currencies ?? [];
+  const currency = currencyRows[0]?._id || "BDT";
+  const monthlyAmounts = new Map();
+  for (const row of result?.monthly ?? []) {
+    monthlyAmounts.set(row._id, count(row.revenueMinor) / 100);
+  }
+
+  return {
+    year,
+    availableYears: [...years].sort((a, b) => b - a),
+    monthlyRevenue: MONTH_LABELS.map((month, index) => ({
+      month,
+      monthNumber: index + 1,
+      revenue: monthlyAmounts.get(index + 1) ?? 0,
+    })),
+    /** Actual currency stored on the payment records used by the series. */
+    currency,
+    currencyBreakdown: currencyRows.map((row) => ({
+      currency: row._id || "BDT",
+      transactions: count(row.transactions),
+      totalRevenue: count(row.amountMinor) / 100,
+    })),
+    timezone: "UTC",
+    revenueBasis:
+      "Gross paid rental volume from verified purchases, deduplicated by Stripe session and grouped by createdAt.",
+    excludedStatuses: {
+      payments: REVENUE_EXCLUDED_PAYMENT_STATUSES,
+      bookings: REVENUE_EXCLUDED_BOOKING_STATUSES,
+    },
   };
 };

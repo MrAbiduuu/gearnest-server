@@ -7,6 +7,7 @@ import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import {
   getAdminAnalyticsOverview,
   getAdminMonthlyBookings,
+  getAdminMonthlyRevenue,
   parseAnalyticsYear,
 } from "./analytics.js";
 import {
@@ -438,6 +439,40 @@ app.get(
         res,
         500,
         "Could not retrieve monthly booking statistics.",
+      );
+    }
+  },
+);
+
+/**
+ * GET /admin/analytics/monthly-revenue?year=2026 - admin-only gross paid
+ * rental volume by calendar month. All 12 months are returned, with zero
+ * values for months without successful payments.
+ */
+app.get(
+  "/admin/analytics/monthly-revenue",
+  authenticate,
+  requireAdmin,
+  async (req, res) => {
+    const year = parseAnalyticsYear(req.query.year);
+    if (year === null) {
+      return sendError(res, 400, "Provide a valid revenue year.");
+    }
+
+    try {
+      const data = await getAdminMonthlyRevenue(database, year);
+
+      return res.status(200).send({
+        success: true,
+        message: "Monthly revenue statistics retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve monthly revenue statistics", error);
+      return sendError(
+        res,
+        500,
+        "Could not retrieve monthly revenue statistics.",
       );
     }
   },
