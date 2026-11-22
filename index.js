@@ -45,7 +45,9 @@ import { startBookingCompletionCron } from "./booking-completion-cron.js";
 const app = express();
 const port = process.env.PORT;
 
-const allowedOrigins = (process.env.FRONTEND_URL ?? "http://localhost:3000")
+const allowedOrigins = (
+  process.env.FRONTEND_URL ?? "https://gearnest-client-opal.vercel.app"
+)
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
@@ -90,7 +92,8 @@ const jwtIssuer = process.env.JWT_ISSUER ?? "gearnest";
 const jwtAudience = process.env.JWT_AUDIENCE ?? "gearnest-api";
 
 const auth = betterAuth({
-  baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
+  baseURL:
+    process.env.BETTER_AUTH_URL ?? "https://gearnest-client-opal.vercel.app",
   secret: process.env.BETTER_AUTH_SECRET,
   database: mongodbAdapter(database, { client: connectedClient }),
   trustedOrigins: allowedOrigins,
