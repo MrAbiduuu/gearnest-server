@@ -3,6 +3,7 @@ import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import { betterAuth } from "better-auth";
+import { jwt } from "better-auth/plugins";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import {
   getAdminAnalyticsOverview,
@@ -79,16 +80,24 @@ const database = connectedClient.db("gearnestdb");
 const users = database.collection("user");
 const equipments = database.collection("equipments");
 
-/**
- * Better Auth verification for Express. It shares the secret and MongoDB
- * adapter with the Next.js app, so the same signed session cookie can be
- * verified here without inventing a JWT or trusting client-supplied identity.
- */
+// The Next.js app signs short-lived JWTs with the shared Better Auth secret
+// and JWKS. Express uses the same issuer/audience so it can verify them here.
+const jwtIssuer = process.env.JWT_ISSUER ?? "gearnest";
+const jwtAudience = process.env.JWT_AUDIENCE ?? "gearnest-api";
+
 const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
   secret: process.env.BETTER_AUTH_SECRET,
   database: mongodbAdapter(database, { client: connectedClient }),
   trustedOrigins: allowedOrigins,
+  plugins: [
+    jwt({
+      jwt: {
+        issuer: jwtIssuer,
+        audience: jwtAudience,
+      },
+    }),
+  ],
   user: {
     additionalFields: {
       role: {
@@ -116,16 +125,14 @@ const safeUserProjection = {
   phone: 1,
 };
 
-const toHeaders = (req) => {
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(req.headers ?? {})) {
-    if (Array.isArray(value)) {
-      for (const entry of value) headers.append(key, entry);
-    } else if (value !== undefined) {
-      headers.set(key, value);
-    }
-  }
-  return headers;
+const getBearerToken = (req) => {
+  const authorization = req.get("authorization");
+  if (!authorization) return null;
+
+  const [scheme, ...parts] = authorization.trim().split(/\s+/);
+  if (scheme?.toLowerCase() !== "bearer") return null;
+
+  return parts.join(" ").trim() || null;
 };
 
 const normalizeRole = (role) => (USER_ROLES.includes(role) ? role : "customer");
@@ -153,29 +160,31 @@ const serializeUser = (user) => ({
 const sendError = (res, status, message) =>
   res.status(status).send({ success: false, message });
 
-const authenticate = async (req, res, next) => {
+/**
+ * Verifies the short-lived Better Auth JWT sent as `Authorization: Bearer ...`.
+ * Signature, issuer, audience and expiry are checked by Better Auth using the
+ * shared JWKS. The role is read from the database on every request, so a
+ * stale token cannot keep privileges after a role change or revocation.
+ */
+const verifyToken = async (req, res, next) => {
   if (!process.env.BETTER_AUTH_SECRET) {
     return sendError(res, 500, "Server authentication is not configured.");
   }
 
-  try {
-    const session = await auth.api.getSession({
-      headers: toHeaders(req),
-      query: { disableCookieCache: true },
-    });
+  const token = getBearerToken(req);
+  if (!token) {
+    return sendError(res, 401, "You must be signed in.");
+  }
 
-    if (
-      !session?.session ||
-      !session.user?.id ||
-      !ObjectId.isValid(session.user.id)
-    ) {
-      return sendError(res, 401, "You must be signed in.");
+  try {
+    const { payload } = await auth.api.verifyJWT({ body: { token } });
+    const subject = String(payload?.sub ?? "");
+    if (!ObjectId.isValid(subject)) {
+      return sendError(res, 401, "Your token is invalid or has expired.");
     }
 
-    // Always read the current role from the database. A role in a cookie,
-    // header, or request body is never trusted for authorization.
     const currentUser = await users.findOne(
-      { _id: new ObjectId(session.user.id) },
+      { _id: new ObjectId(subject) },
       { projection: safeUserProjection },
     );
 
@@ -186,31 +195,93 @@ const authenticate = async (req, res, next) => {
     req.authUser = serializeUser(currentUser);
     return next();
   } catch (error) {
-    console.error("Could not verify Better Auth session", error);
-    return sendError(res, 401, "Your session is invalid or has expired.");
+    console.error("Could not verify JWT", error);
+    return sendError(res, 401, "Your token is invalid or has expired.");
   }
 };
 
-const requireAdmin = (req, res, next) => {
+const verifyAdmin = (req, res, next) => {
   if (req.authUser?.role !== "admin") {
     return sendError(res, 403, "Admin access required.");
   }
   return next();
 };
 
-const requireOwner = (req, res, next) => {
+const verifyOwner = (req, res, next) => {
   if (req.authUser?.role !== "owner") {
     return sendError(res, 403, "Owner access required.");
   }
   return next();
 };
 
-const requireCustomer = (req, res, next) => {
+const verifyCustomer = (req, res, next) => {
   if (req.authUser?.role !== "customer") {
     return sendError(res, 403, "Customer access required.");
   }
   return next();
 };
+
+const PRIVATE_EQUIPMENT_STATUSES = ["all", "pending", "rejected"];
+
+/**
+ * The public catalog only exposes approved listings. Owner/admin moderation
+ * views (status=all|pending|rejected) require a verified token.
+ */
+const verifyEquipmentListAccess = (req, res, next) => {
+  const status =
+    typeof req.query.status === "string"
+      ? req.query.status.trim().toLowerCase()
+      : "approved";
+
+  req.equipmentStatusFilter = status;
+
+  if (!PRIVATE_EQUIPMENT_STATUSES.includes(status)) {
+    return next();
+  }
+
+  return verifyToken(req, res, () => {
+    if (req.authUser?.role !== "owner" && req.authUser?.role !== "admin") {
+      return sendError(res, 403, "Owner or admin access required.");
+    }
+    return next();
+  });
+};
+
+/** Owners may only change or remove listings that belong to their account. */
+const verifyEquipmentOwnership = async (req, res, next) => {
+  const id = req.params.id;
+  if (!ObjectId.isValid(id)) {
+    return sendError(res, 400, "Invalid equipment ID.");
+  }
+
+  try {
+    const equipment = await equipments.findOne(
+      { _id: new ObjectId(id) },
+      { projection: { owner: 1 } },
+    );
+
+    if (!equipment) {
+      return sendError(res, 404, "Equipment not found.");
+    }
+
+    const ownerEmail = String(equipment.owner?.email ?? "")
+      .trim()
+      .toLowerCase();
+    const userEmail = String(req.authUser?.email ?? "").trim().toLowerCase();
+
+    if (!ownerEmail || ownerEmail !== userEmail) {
+      return sendError(res, 403, "You can only manage your own equipment.");
+    }
+
+    return next();
+  } catch (error) {
+    console.error("Could not verify equipment ownership", error);
+    return sendError(res, 500, "Could not verify equipment ownership.");
+  }
+};
+
+/** Reusable chain for owner-scoped equipment mutations. */
+const verifyOwnedEquipment = [verifyToken, verifyOwner, verifyEquipmentOwnership];
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -218,7 +289,7 @@ const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  * GET /users - admin-only, searchable, filterable, paginated user list.
  * Query params: role=all|customer|owner|admin, search=<text>, page, limit.
  */
-app.get("/users", authenticate, requireAdmin, async (req, res) => {
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const requestedRole =
       typeof req.query.role === "string"
@@ -293,7 +364,7 @@ app.get("/users", authenticate, requireAdmin, async (req, res) => {
 });
 
 /** PATCH /users/:id/role - admin-only role assignment. */
-app.patch("/users/:id/role", authenticate, requireAdmin, async (req, res) => {
+app.patch("/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -359,7 +430,7 @@ app.patch("/users/:id/role", authenticate, requireAdmin, async (req, res) => {
 });
 
 /** DELETE /users/:id - admin-only account deletion with auth cleanup. */
-app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
+app.delete("/users/:id", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     if (!ObjectId.isValid(id)) {
@@ -428,7 +499,7 @@ app.delete("/users/:id", authenticate, requireAdmin, async (req, res) => {
  * GET /admin/analytics - admin-only aggregated platform overview.
  * All metrics, including the latest bookings, come from MongoDB.
  */
-app.get("/admin/analytics", authenticate, requireAdmin, async (req, res) => {
+app.get("/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const data = await getAdminAnalyticsOverview(database);
 
@@ -449,8 +520,8 @@ app.get("/admin/analytics", authenticate, requireAdmin, async (req, res) => {
  */
 app.get(
   "/admin/analytics/monthly-bookings",
-  authenticate,
-  requireAdmin,
+  verifyToken,
+  verifyAdmin,
   async (req, res) => {
     const year = parseAnalyticsYear(req.query.year);
     if (year === null) {
@@ -483,8 +554,8 @@ app.get(
  */
 app.get(
   "/admin/analytics/monthly-revenue",
-  authenticate,
-  requireAdmin,
+  verifyToken,
+  verifyAdmin,
   async (req, res) => {
     const year = parseAnalyticsYear(req.query.year);
     if (year === null) {
@@ -515,7 +586,7 @@ app.get(
  * Query params: status=all|pending|confirmed|cancelled, search, page, limit,
  * sort=newest|oldest.
  */
-app.get("/admin/bookings", authenticate, requireAdmin, async (req, res) => {
+app.get("/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
   const options = parseBookingsQuery(req.query);
   if (!options) {
     return sendError(res, 400, "Invalid booking search parameters.");
@@ -538,8 +609,8 @@ app.get("/admin/bookings", authenticate, requireAdmin, async (req, res) => {
 /** PATCH /admin/bookings/:id/status - admin-only booking status moderation. */
 app.patch(
   "/admin/bookings/:id/status",
-  authenticate,
-  requireAdmin,
+  verifyToken,
+  verifyAdmin,
   async (req, res) => {
     const requestedStatus = req.body?.status;
     if (!isBookingStatus(requestedStatus)) {
@@ -588,8 +659,8 @@ app.patch(
  */
 app.get(
   "/customer/dashboard/overview",
-  authenticate,
-  requireCustomer,
+  verifyToken,
+  verifyCustomer,
   async (req, res) => {
     try {
       const data = await getCustomerDashboardOverview(database, req.authUser);
@@ -611,8 +682,8 @@ app.get(
  */
 app.get(
   "/customer/dashboard/booking-status",
-  authenticate,
-  requireCustomer,
+  verifyToken,
+  verifyCustomer,
   async (req, res) => {
     try {
       const data = await getCustomerBookingStatus(database, req.authUser);
@@ -634,8 +705,8 @@ app.get(
  */
 app.get(
   "/customer/dashboard/booking-analytics",
-  authenticate,
-  requireCustomer,
+  verifyToken,
+  verifyCustomer,
   async (req, res) => {
     const requestedPeriod =
       typeof req.query.period === "string" && req.query.period.trim()
@@ -670,8 +741,8 @@ app.get(
  */
 app.get(
   "/customer/dashboard/recent-bookings",
-  authenticate,
-  requireCustomer,
+  verifyToken,
+  verifyCustomer,
   async (req, res) => {
     if (
       req.query.limit !== undefined &&
@@ -705,8 +776,8 @@ app.get(
  */
 app.get(
   "/owner/dashboard/overview",
-  authenticate,
-  requireOwner,
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     try {
       const data = await getOwnerDashboardOverview(database, req.authUser);
@@ -728,8 +799,8 @@ app.get(
  */
 app.get(
   "/owner/dashboard/revenue",
-  authenticate,
-  requireOwner,
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     const year = parseAnalyticsYear(req.query.year);
     if (year === null) {
@@ -760,8 +831,8 @@ app.get(
  */
 app.get(
   "/owner/dashboard/monthly-bookings",
-  authenticate,
-  requireOwner,
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     const year = parseAnalyticsYear(req.query.year);
     if (year === null) {
@@ -790,7 +861,7 @@ app.get(
  * GET /owner/rentals - owner-only rental requests received for the owner's
  * equipment. Query params: status, search, page, limit, sort.
  */
-app.get("/owner/rentals", authenticate, requireOwner, async (req, res) => {
+app.get("/owner/rentals", verifyToken, verifyOwner, async (req, res) => {
   const options = parseBookingsQuery(req.query);
   if (!options) {
     return sendError(res, 400, "Invalid rental search parameters.");
@@ -812,8 +883,8 @@ app.get("/owner/rentals", authenticate, requireOwner, async (req, res) => {
 /** GET /owner/rentals/stats - owner-global rental counts. */
 app.get(
   "/owner/rentals/stats",
-  authenticate,
-  requireOwner,
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     try {
       const data = await getOwnerRentalStats(database, req.authUser);
@@ -835,8 +906,8 @@ app.get(
  */
 app.patch(
   "/owner/rentals/:id/status",
-  authenticate,
-  requireOwner,
+  verifyToken,
+  verifyOwner,
   async (req, res) => {
     const requestedStatus = req.body?.status;
     if (!isBookingStatus(requestedStatus)) {
@@ -896,12 +967,9 @@ app.patch(
  * `status=all` so pending submissions remain visible to the people who manage
  * them without exposing them on the public catalog.
  */
-app.get("/equipments", async (req, res) => {
+app.get("/equipments", verifyEquipmentListAccess, async (req, res) => {
   try {
-    const requestedStatus =
-      typeof req.query.status === "string"
-        ? req.query.status.trim().toLowerCase()
-        : "approved";
+    const requestedStatus = req.equipmentStatusFilter;
 
     if (
       !["all", "approved", "pending", "rejected"].includes(requestedStatus)
@@ -940,8 +1008,8 @@ app.get("/equipments", async (req, res) => {
  */
 app.patch(
   "/admin/equipments/:id/status",
-  authenticate,
-  requireAdmin,
+  verifyToken,
+  verifyAdmin,
   async (req, res) => {
     const requestedStatus = req.body?.status;
     if (!isEquipmentStatus(requestedStatus)) {
@@ -983,8 +1051,8 @@ app.patch(
   },
 );
 
-// creating a new equipment listing
-app.post("/equipments", async (req, res) => {
+// creating a new equipment listing (owners only)
+app.post("/equipments", verifyToken, verifyOwner, async (req, res) => {
   try {
     const {
       name,
@@ -999,7 +1067,6 @@ app.post("/equipments", async (req, res) => {
       location,
       rentalTerms,
       imageUrls,
-      owner,
     } = req.body ?? {};
 
     const requiredFields = {
@@ -1061,10 +1128,11 @@ app.post("/equipments", async (req, res) => {
       location: String(location).trim(),
       rentalTerms: String(rentalTerms ?? "").trim(),
       status: "pending",
+      // Ownership comes from the verified token, never from the request body.
       owner: {
-        name: String(owner?.name ?? "").trim(),
-        email: String(owner?.email ?? "").trim(),
-        isVerified: owner?.isVerified ?? true,
+        name: req.authUser.name,
+        email: req.authUser.email,
+        isVerified: req.authUser.emailVerified === true,
       },
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -1124,8 +1192,8 @@ app.get("/equipments/:id", async (req, res) => {
   }
 });
 
-// updating an equipment listing
-app.patch("/equipments/:id", async (req, res) => {
+// updating an equipment listing (only the owner who published it)
+app.patch("/equipments/:id", verifyOwnedEquipment, async (req, res) => {
   try {
     const id = req.params.id;
 
@@ -1232,8 +1300,8 @@ app.patch("/equipments/:id", async (req, res) => {
   }
 });
 
-// deleting an equipment listing
-app.delete("/equipments/:id", async (req, res) => {
+// deleting an equipment listing (only the owner who published it)
+app.delete("/equipments/:id", verifyOwnedEquipment, async (req, res) => {
   try {
     const id = req.params.id;
 
