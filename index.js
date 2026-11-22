@@ -25,6 +25,11 @@ import {
   getOwnerDashboardOverview,
   getOwnerMonthlyRevenue,
 } from "./owner-dashboard.js";
+import {
+  getOwnerRentalStats,
+  getOwnerRentals,
+  updateOwnerRentalStatus,
+} from "./owner-rentals.js";
 
 const app = express();
 const port = process.env.PORT;
@@ -611,6 +616,109 @@ app.get(
         500,
         "Could not retrieve your monthly revenue analytics.",
       );
+    }
+  },
+);
+
+/**
+ * GET /owner/rentals - owner-only rental requests received for the owner's
+ * equipment. Query params: status, search, page, limit, sort.
+ */
+app.get("/owner/rentals", authenticate, requireOwner, async (req, res) => {
+  const options = parseBookingsQuery(req.query);
+  if (!options) {
+    return sendError(res, 400, "Invalid rental search parameters.");
+  }
+
+  try {
+    const data = await getOwnerRentals(database, req.authUser, options);
+    return res.status(200).send({
+      success: true,
+      message: "Rental requests retrieved successfully",
+      data,
+    });
+  } catch (error) {
+    console.error("Could not retrieve owner rentals", error);
+    return sendError(res, 500, "Could not load your rental requests.");
+  }
+});
+
+/** GET /owner/rentals/stats - owner-global rental counts. */
+app.get(
+  "/owner/rentals/stats",
+  authenticate,
+  requireOwner,
+  async (req, res) => {
+    try {
+      const data = await getOwnerRentalStats(database, req.authUser);
+      return res.status(200).send({
+        success: true,
+        message: "Rental statistics retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve owner rental statistics", error);
+      return sendError(res, 500, "Could not load your rental statistics.");
+    }
+  },
+);
+
+/**
+ * PATCH /owner/rentals/:id/status - owner approval/rejection for a pending
+ * request, using the shared booking transition rules.
+ */
+app.patch(
+  "/owner/rentals/:id/status",
+  authenticate,
+  requireOwner,
+  async (req, res) => {
+    const requestedStatus = req.body?.status;
+    if (!isBookingStatus(requestedStatus)) {
+      return sendError(res, 400, "Invalid rental status.");
+    }
+
+    try {
+      const result = await updateOwnerRentalStatus(
+        database,
+        req.authUser,
+        req.params.id,
+        requestedStatus,
+      );
+
+      if (result.invalidRequest) {
+        return sendError(res, 400, "Invalid rental ID or status.");
+      }
+      if (result.notFound) {
+        return sendError(res, 404, "Rental request not found.");
+      }
+      if (result.invalidTransition) {
+        return sendError(
+          res,
+          409,
+          `Cannot change a ${result.current} request to ${requestedStatus}.`,
+        );
+      }
+      if (result.conflict) {
+        return sendError(res, 409, result.detail ?? "This request is no longer available.");
+      }
+      if (result.stale) {
+        return sendError(
+          res,
+          409,
+          "This request was already updated. Refresh and try again.",
+        );
+      }
+
+      return res.status(200).send({
+        success: true,
+        message: result.unchanged
+          ? "Rental status is already up to date."
+          : "Rental request updated successfully",
+        data: result.booking,
+      });
+    } catch (error) {
+      console.error("Could not update owner rental status", error);
+      return sendError(res, 500, "Could not update this rental request.");
     }
   },
 );
