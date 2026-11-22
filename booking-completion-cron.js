@@ -57,7 +57,7 @@ export const completeExpiredBookings = async (database, now = new Date()) => {
     .find({
       status: { $in: CONFIRMED_STATUS_VALUES },
       endDate: { $exists: true, $nin: [null, ""] },
-      completedAt: { $exists: false },
+      completedAt: { $in: [null] },
     })
     .project({ status: 1, endDate: 1 })
     .toArray();

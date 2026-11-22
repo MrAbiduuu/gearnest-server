@@ -969,7 +969,8 @@ app.patch(
 /**
  * GET /equipments - approved listings by default. Admin/owner views request
  * `status=all` so pending submissions remain visible to the people who manage
- * them without exposing them on the public catalog.
+ * them without exposing them on the public catalog. `limit=<n>` caps the number
+ * of MongoDB results (1-50) for sections such as Featured Equipment.
  */
 app.get("/equipments", verifyEquipmentListAccess, async (req, res) => {
   try {
@@ -990,6 +991,14 @@ app.get("/equipments", verifyEquipmentListAccess, async (req, res) => {
     }
 
     pipeline.push({ $project: { normalizedStatus: 0 } });
+
+    const requestedLimit =
+      typeof req.query.limit === "string"
+        ? Number.parseInt(req.query.limit, 10)
+        : Number.NaN;
+    if (Number.isInteger(requestedLimit) && requestedLimit > 0) {
+      pipeline.push({ $limit: Math.min(requestedLimit, 50) });
+    }
 
     const result = await equipments.aggregate(pipeline).toArray();
 
@@ -1254,12 +1263,12 @@ app.patch("/equipments/:id", verifyOwnedEquipment, async (req, res) => {
       !Number.isFinite(rentalRate) ||
       rentalRate <= 0 ||
       !Number.isInteger(availableStock) ||
-      availableStock < 1
+      availableStock < 0
     ) {
       return res.status(400).send({
         success: false,
         message:
-          "Rental rate and available stock must be valid positive numbers.",
+          "Rental rate must be positive and available stock cannot be negative.",
       });
     }
 
