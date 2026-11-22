@@ -17,6 +17,14 @@ import {
   updateAdminBookingStatus,
 } from "./bookings.js";
 import {
+  getCustomerBookingAnalytics,
+  getCustomerBookingStatus,
+  getCustomerDashboardOverview,
+  getCustomerRecentBookings,
+  parseBookingPeriod,
+  parseRecentBookingLimit,
+} from "./customer-dashboard.js";
+import {
   equipmentStatusExpression,
   isEquipmentStatus,
   updateEquipmentStatus,
@@ -193,6 +201,13 @@ const requireAdmin = (req, res, next) => {
 const requireOwner = (req, res, next) => {
   if (req.authUser?.role !== "owner") {
     return sendError(res, 403, "Owner access required.");
+  }
+  return next();
+};
+
+const requireCustomer = (req, res, next) => {
+  if (req.authUser?.role !== "customer") {
+    return sendError(res, 403, "Customer access required.");
   }
   return next();
 };
@@ -562,6 +577,124 @@ app.patch(
     } catch (error) {
       console.error("Could not update booking status", error);
       return sendError(res, 500, "Could not update booking status.");
+    }
+  },
+);
+
+/**
+ * GET /customer/dashboard/overview - customer-only dashboard metrics. The
+ * customer is resolved from the verified session; no customer ID is accepted
+ * from the request.
+ */
+app.get(
+  "/customer/dashboard/overview",
+  authenticate,
+  requireCustomer,
+  async (req, res) => {
+    try {
+      const data = await getCustomerDashboardOverview(database, req.authUser);
+      return res.status(200).send({
+        success: true,
+        message: "Customer dashboard retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve customer dashboard", error);
+      return sendError(res, 500, "Could not retrieve your dashboard.");
+    }
+  },
+);
+
+/**
+ * GET /customer/dashboard/booking-status - customer-only status counts using
+ * the three real booking statuses.
+ */
+app.get(
+  "/customer/dashboard/booking-status",
+  authenticate,
+  requireCustomer,
+  async (req, res) => {
+    try {
+      const data = await getCustomerBookingStatus(database, req.authUser);
+      return res.status(200).send({
+        success: true,
+        message: "Customer booking status retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve customer booking status", error);
+      return sendError(res, 500, "Could not retrieve your booking status.");
+    }
+  },
+);
+
+/**
+ * GET /customer/dashboard/booking-analytics?period=6months - customer-only
+ * monthly booking activity. Supported periods are 3months, 6months, 12months.
+ */
+app.get(
+  "/customer/dashboard/booking-analytics",
+  authenticate,
+  requireCustomer,
+  async (req, res) => {
+    const requestedPeriod =
+      typeof req.query.period === "string" && req.query.period.trim()
+        ? req.query.period.trim().toLowerCase()
+        : "6months";
+    const months = parseBookingPeriod(requestedPeriod);
+    if (months === null) {
+      return sendError(res, 400, "Provide a valid booking analytics period.");
+    }
+
+    try {
+      const data = await getCustomerBookingAnalytics(
+        database,
+        req.authUser,
+        months,
+      );
+      return res.status(200).send({
+        success: true,
+        message: "Customer booking analytics retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve customer booking analytics", error);
+      return sendError(res, 500, "Could not retrieve your booking analytics.");
+    }
+  },
+);
+
+/**
+ * GET /customer/dashboard/recent-bookings?limit=3 - customer-only latest
+ * bookings enriched with the associated equipment details.
+ */
+app.get(
+  "/customer/dashboard/recent-bookings",
+  authenticate,
+  requireCustomer,
+  async (req, res) => {
+    if (
+      req.query.limit !== undefined &&
+      (typeof req.query.limit !== "string" ||
+        !/^\d+$/.test(req.query.limit.trim()))
+    ) {
+      return sendError(res, 400, "Provide a valid recent booking limit.");
+    }
+
+    try {
+      const data = await getCustomerRecentBookings(
+        database,
+        req.authUser,
+        parseRecentBookingLimit(req.query.limit),
+      );
+      return res.status(200).send({
+        success: true,
+        message: "Customer recent bookings retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve customer recent bookings", error);
+      return sendError(res, 500, "Could not retrieve your recent bookings.");
     }
   },
 );
