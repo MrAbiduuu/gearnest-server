@@ -573,3 +573,93 @@ export const getOwnerMonthlyRevenue = async (database, authUser, year) => {
     },
   };
 };
+
+/**
+ * GET /owner/dashboard/monthly-bookings?year=... data. Every rental request
+ * tied to the authenticated owner's equipment is grouped by creation month and
+ * booking status. All 12 months are returned; months without requests stay 0.
+ */
+export const getOwnerMonthlyBookings = async (database, authUser, year) => {
+  const email = ownerEmail(authUser);
+  const purchases = database.collection(PURCHASE_COLLECTION);
+  const start = new Date(Date.UTC(year, 0, 1));
+  const end = new Date(Date.UTC(year + 1, 0, 1));
+  const currentYear = new Date().getUTCFullYear();
+
+  const [result] = await purchases
+    .aggregate([
+      ownerEquipmentLookup(email),
+      { $match: { "ownerEquipment.0": { $exists: true } } },
+      {
+        $addFields: {
+          createdAtDate: createdAtDateExpression,
+          bookingStatus: bookingStatusExpression,
+        },
+      },
+      { $match: { createdAtDate: { $ne: null } } },
+      {
+        $facet: {
+          years: [
+            { $group: { _id: { $year: "$createdAtDate" } } },
+            { $sort: { _id: -1 } },
+          ],
+          monthly: [
+            { $match: { createdAtDate: { $gte: start, $lt: end } } },
+            {
+              $group: {
+                _id: {
+                  month: { $month: "$createdAtDate" },
+                  status: "$bookingStatus",
+                },
+                count: { $sum: 1 },
+              },
+            },
+          ],
+        },
+      },
+    ])
+    .toArray();
+
+  const years = new Set([currentYear, year]);
+  for (const row of result?.years ?? []) {
+    if (Number.isInteger(row._id)) years.add(row._id);
+  }
+
+  const monthlyCounts = new Map();
+  for (const row of result?.monthly ?? []) {
+    const month = Number(row?._id?.month);
+    if (!Number.isInteger(month) || month < 1 || month > 12) continue;
+
+    const entry = monthlyCounts.get(month) ?? {
+      totalBookings: 0,
+      pendingBookings: 0,
+      confirmedBookings: 0,
+      cancelledBookings: 0,
+    };
+    const value = count(row.count);
+    entry.totalBookings += value;
+
+    if (row._id.status === "pending") entry.pendingBookings += value;
+    else if (row._id.status === "cancelled") entry.cancelledBookings += value;
+    else entry.confirmedBookings += value;
+
+    monthlyCounts.set(month, entry);
+  }
+
+  return {
+    year,
+    availableYears: [...years].sort((a, b) => b - a),
+    monthlyBookings: MONTH_LABELS.map((month, index) => ({
+      month,
+      monthNumber: index + 1,
+      ...(monthlyCounts.get(index + 1) ?? {
+        totalBookings: 0,
+        pendingBookings: 0,
+        confirmedBookings: 0,
+        cancelledBookings: 0,
+      }),
+    })),
+    bookingStatusesIncluded: ["pending", "confirmed", "cancelled"],
+    timezone: "UTC",
+  };
+};

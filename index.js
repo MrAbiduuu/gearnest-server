@@ -23,6 +23,7 @@ import {
 } from "./equipment-moderation.js";
 import {
   getOwnerDashboardOverview,
+  getOwnerMonthlyBookings,
   getOwnerMonthlyRevenue,
 } from "./owner-dashboard.js";
 import {
@@ -615,6 +616,38 @@ app.get(
         res,
         500,
         "Could not retrieve your monthly revenue analytics.",
+      );
+    }
+  },
+);
+
+/**
+ * GET /owner/dashboard/monthly-bookings?year=2026 - owner-only monthly rental
+ * request volume. All 12 months are returned; months without requests stay 0.
+ */
+app.get(
+  "/owner/dashboard/monthly-bookings",
+  authenticate,
+  requireOwner,
+  async (req, res) => {
+    const year = parseAnalyticsYear(req.query.year);
+    if (year === null) {
+      return sendError(res, 400, "Provide a valid booking year.");
+    }
+
+    try {
+      const data = await getOwnerMonthlyBookings(database, req.authUser, year);
+      return res.status(200).send({
+        success: true,
+        message: "Owner booking analytics retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve owner booking analytics", error);
+      return sendError(
+        res,
+        500,
+        "Could not retrieve your monthly booking analytics.",
       );
     }
   },
