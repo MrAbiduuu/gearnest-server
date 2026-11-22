@@ -21,6 +21,10 @@ import {
   isEquipmentStatus,
   updateEquipmentStatus,
 } from "./equipment-moderation.js";
+import {
+  getOwnerDashboardOverview,
+  getOwnerMonthlyRevenue,
+} from "./owner-dashboard.js";
 
 const app = express();
 const port = process.env.PORT;
@@ -176,6 +180,13 @@ const authenticate = async (req, res, next) => {
 const requireAdmin = (req, res, next) => {
   if (req.authUser?.role !== "admin") {
     return sendError(res, 403, "Admin access required.");
+  }
+  return next();
+};
+
+const requireOwner = (req, res, next) => {
+  if (req.authUser?.role !== "owner") {
+    return sendError(res, 403, "Owner access required.");
   }
   return next();
 };
@@ -545,6 +556,61 @@ app.patch(
     } catch (error) {
       console.error("Could not update booking status", error);
       return sendError(res, 500, "Could not update booking status.");
+    }
+  },
+);
+
+/**
+ * GET /owner/dashboard/overview - owner-only dashboard data. The owner is
+ * resolved from the verified session; no client-supplied owner ID is accepted.
+ */
+app.get(
+  "/owner/dashboard/overview",
+  authenticate,
+  requireOwner,
+  async (req, res) => {
+    try {
+      const data = await getOwnerDashboardOverview(database, req.authUser);
+      return res.status(200).send({
+        success: true,
+        message: "Owner dashboard retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve owner dashboard", error);
+      return sendError(res, 500, "Could not retrieve your dashboard.");
+    }
+  },
+);
+
+/**
+ * GET /owner/dashboard/revenue?year=2026 - owner-only monthly paid rental
+ * volume. All 12 months are returned; months without payments remain zero.
+ */
+app.get(
+  "/owner/dashboard/revenue",
+  authenticate,
+  requireOwner,
+  async (req, res) => {
+    const year = parseAnalyticsYear(req.query.year);
+    if (year === null) {
+      return sendError(res, 400, "Provide a valid revenue year.");
+    }
+
+    try {
+      const data = await getOwnerMonthlyRevenue(database, req.authUser, year);
+      return res.status(200).send({
+        success: true,
+        message: "Owner revenue analytics retrieved successfully",
+        data,
+      });
+    } catch (error) {
+      console.error("Could not retrieve owner revenue analytics", error);
+      return sendError(
+        res,
+        500,
+        "Could not retrieve your monthly revenue analytics.",
+      );
     }
   },
 );
